@@ -17,55 +17,32 @@ from model.io import load_h5
 from segan_test import segan_hr
 
 
-class WGAN():
-    def __init__(self, upsample_scale = 2):
+class RGAN():
+    def __init__(self, upsample_scale=2):
         self.audio_shape = 8192
         self.shape_hr = (8192, 1)
         self.shape_lr = (8192, 1)
-        self.lr = 1e-4
-        self.gen_lr = 1e-4
+        self.lr = 5e-5
+        self.gen_lr = 5e-5
 
         # Following parameter and optimizer set as recommended in paper
         self.n_discriminator = 5
         self.clip_value = 0.01
-        self.gan_loss = self.wasserstein_loss
-        self.dis_loss = self.wasserstein_loss
 
         optimizer = Adam(lr=0.0001)
 
-        # Now we initialize the generator and discriminator.
-        self.discriminator = self.build_discriminator()
-        self.generator = self.build_generator()
-
-        self.compile_generator(self.generator)
-        self.compile_discriminator(self.discriminator)
-
-        self.discriminator.trainable = False
-        # The generator takes noise as input and generated imgs
-        audio = Input(shape=self.shape_lr)
-        gen_audio = self.generator(audio)
-
-        # The discriminator takes generated images as input and determines validity
-        valid = self.discriminator(gen_audio)
-
-        # The combined model  (stacked generator and discriminator)
-        self.combined = Model(audio, valid)
-        self.compile_combined(self.combined)
-        self.discriminator.trainable = True
-
-
-    def compile_generator(self, model):
+    def compile_generator(self, model, loss):
         """Compile the generator with appropriate optimizer"""
         model.compile(
-            loss=self.gan_loss,
+            loss=loss,
             optimizer=Adam(self.gen_lr, 0.9),
             metrics=['mse', self.PSNR]
         )
 
-    def compile_discriminator(self, model):
+    def compile_discriminator(self, model, loss):
         """Compile the generator with appropriate optimizer"""
         model.compile(
-            loss=self.dis_loss,
+            loss=loss,
             optimizer=Adam(self.lr, 0.9),
             metrics=['accuracy']
         )
@@ -76,9 +53,6 @@ class WGAN():
             loss=self.wasserstein_loss,
             optimizer=Adam(self.lr, 0.9)
         )
-
-    def wasserstein_loss(self, y_true, y_pred):
-        return K.mean(y_true * y_pred)
 
     def PSNR(self, y_true, y_pred):
         """
@@ -140,10 +114,10 @@ class WGAN():
         lr_audio = Input(shape=self.shape_lr)
         x = Conv1D(16, 3, strides=1, padding="same")(lr_audio)
 
-        #n_filters = [128, 256, 512, 512, 512, 512, 512, 512]
-        #n_filtersizes = [65, 33, 17, 9, 9, 9, 9, 9, 9]
+        # n_filters = [128, 256, 512, 512, 512, 512, 512, 512]
+        # n_filtersizes = [65, 33, 17, 9, 9, 9, 9, 9, 9]
         n_filters = [128, 256]
-        n_filtersizes = [65, 33]
+        n_filtersizes = [9, 9]
 
         for nf, fs in zip(n_filters, n_filtersizes):
             x = Conv1D(nf, fs, strides=1, padding="same")(x)
@@ -158,16 +132,15 @@ class WGAN():
             x = Dropout(0.5)(x)
 
         x = Activation("tanh")(x)
-        hr_output = Conv1DTranspose(1,9)(x)
+        hr_output = Conv1DTranspose(1, 9)(x)
 
         model = Model(inputs=lr_audio, outputs=hr_output)
         model.summary()
 
         return model
 
-
     def build_discriminator(self):
-        filters = 64
+        filters = 32
 
         def conv1d_block(input, filters, strides=1, bn=True):
             d = Conv1D(filters, kernel_size=3, strides=strides, padding='same')(input)
@@ -182,7 +155,6 @@ class WGAN():
         x = conv1d_block(x, filters * 2)
         x = conv1d_block(x, filters * 2, strides=2)
         x = conv1d_block(x, filters * 4, strides=2)
-        x = conv1d_block(x, filters * 8, strides=2)
         x = Dense(filters * 16)(x)
         x = LeakyReLU(alpha=0.2)(x)
         x = Flatten()(x)
@@ -195,53 +167,81 @@ class WGAN():
         return model
 
     def train(self, epochs, batch_size=128, sample_interval=50):
+        adam_op = Adam(lr=0.0002, beta_1=0.5, beta_2=0.999)
+
+        self.discriminator = self.build_discriminator()
+        self.generator = self.build_generator()
+
+        audio_hr = Input(shape=self.shape_hr)
+        audio_lr = Input(shape=self.shape_lr)
+
+        gen_audio = self.generator(audio_lr)
+
+        y_real = self.discriminator(audio_hr)
+        y_gene = self.discriminator(gen_audio)
+        y = np.zeros((batch_size, 1), dtype=np.float32)
+
+        BCE_stable = K.binary_crossentropy
+
+        # def rel_gen_loss(y_true, y_pred):
+        #     return BCE_stable(y_real, y_gene)
+        #
+        # def rel_disc_loss(y_true, y_pred):
+        #     return BCE_stable(y_real, y_gene)
+
+        def rel_disc_loss(y_true, y_pred):
+            epsilon = 0.000001
+            return -(K.mean(K.log(K.sigmoid(y_real - K.mean(y_gene, axis=0)) + epsilon), axis=0)
+                     + K.mean(K.log(1 - K.sigmoid(y_gene - K.mean(y_real, axis=0)) + epsilon), axis=0))
+
+        def rel_gen_loss(y_true, y_pred):
+            epsilon = 0.000001
+            return -(K.mean(K.log(K.sigmoid(y_gene - K.mean(y_real, axis=0)) + epsilon), axis=0)
+                     + K.mean(K.log(1 - K.sigmoid(y_real - K.mean(y_gene, axis=0)) + epsilon), axis=0))
+
+
+        self.generator_train = Model([audio_lr, audio_hr], [y_real, y_gene])
+        self.discriminator.trainable = False
+        self.compile_generator(self.generator_train, [rel_gen_loss, None])
+
+        self.discriminator_train = Model([audio_lr, audio_hr], [y_real, y_gene])
+        self.generator.trainable = False
+        self.discriminator.trainable = True
+        self.compile_discriminator(self.discriminator_train, [rel_disc_loss, None])
 
         # Load the dataset
-        X_train_, Y_train_ = load_h5('./data/vctk/speaker1/vctk-speaker1-train.4.16000.8192.4096.h5')
-        X_val_, Y_val_ = load_h5('./data/vctk/speaker1/vctk-speaker1-val.4.16000.8192.4096.h5')
+        X_train_, Y_train_ = load_h5('./data/speaker1/vctk-speaker1-train.4.16000.8192.4096.h5')
+        X_val_, Y_val_ = load_h5('./data/speaker1/vctk-speaker1-val.4.16000.8192.4096.h5')
 
         train_data = DataSet(X_train_, Y_train_)
         val_data = DataSet(X_val_, Y_val_)
 
-        # Adversarial ground truths
-        valid = -np.ones((batch_size, 1))
-        fake = np.ones((batch_size, 1))
 
         for epoch in range(epochs):
 
             audios_lr, audios_hr = train_data.next_batch(batch_size)
             audios_lr = segan_hr(audios_lr)
-            # print("Batch size: ", audios_hr.shape, audios_lr.shape)
 
-            for _ in range(self.n_discriminator):
+            # ---------------------
+            #  Train Discriminator
+            # ---------------------
 
-                # ---------------------
-                #  Train Discriminator
-                # ---------------------
+            # Select a random batch of images
+            # idx = np.random.randint(0, X_train.shape[0], batch_size)
 
-                # Select a random batch of images
-                # idx = np.random.randint(0, X_train.shape[0], batch_size)
-
-                # Generate a batch of new images
-                gen_audios = self.generator.predict(audios_lr)
-
-                # Train the discriminator
-                d_loss_real = self.discriminator.train_on_batch(audios_hr, valid)
-                d_loss_fake = self.discriminator.train_on_batch(gen_audios, fake)
-                d_loss = 0.5 * np.add(d_loss_fake, d_loss_real)
-
-                # Clip discriminator weights
-                for l in self.discriminator.layers:
-                    weights = l.get_weights()
-                    weights = [np.clip(w, -self.clip_value, self.clip_value) for w in weights]
-                    l.set_weights(weights)
+            # Generate a batch of new images
+            # gen_audios = self.generator.predict(audios_lr)
+            self.discriminator.trainable = True
+            self.generator.trainable = False
+            # Train the discriminator
+            d_loss = self.discriminator_train.train_on_batch([audios_lr, audios_hr], y)
 
             # ---------------------
             #  Train Generator
             # ---------------------
             self.discriminator.trainable = False
-            g_loss = self.combined.train_on_batch(audios_lr, valid)
-            self.discriminator.trainable = True
+            self.generator.trainable = True
+            g_loss = self.generator_train.train_on_batch([audios_lr, audios_hr], y)
             # Plot the progress
             print("[{} D loss:{}] [G loss: {}]".format(epoch, d_loss, g_loss))
 
@@ -252,7 +252,7 @@ class WGAN():
 
 
 if __name__ == '__main__':
-    wgan = WGAN()
-    wgan.load_weights("./400_generator.h5", "./400_discriminator.h5")
-    wgan.train(epochs=400, batch_size=128, sample_interval=10)
-    wgan.save_weights("./")
+    gan = RGAN()
+    # wgan.load_weights("./4_blocks_generator.h5", "./4_blocks_discriminator.h5")
+    gan.train(epochs=100, batch_size=32, sample_interval=10)
+    gan.save_weights("./")
